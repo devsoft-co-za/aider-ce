@@ -14,14 +14,21 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from litellm import experimental_mcp_client
-
 from aider import urls, utils
 
 # Import the change tracker
 from aider.change_tracker import ChangeTracker
-from aider.mcp.server import LocalServer
 from aider.repo import ANY_GIT_ERROR
+
+try:
+    from litellm import experimental_mcp_client
+except ImportError:
+    experimental_mcp_client = None
+
+try:
+    from aider.mcp.server import LocalServer
+except ImportError:
+    LocalServer = None
 
 # Import run_cmd for potentially interactive execution and run_cmd_subprocess for guaranteed non-interactive
 from aider.tools import (

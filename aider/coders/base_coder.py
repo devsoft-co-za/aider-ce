@@ -5,14 +5,11 @@ import base64
 import hashlib
 import json
 import locale
-import math
 import mimetypes
 import os
 import platform
 import re
 import sys
-import threading
-import time
 import traceback
 import weakref
 from collections import defaultdict
@@ -24,12 +21,15 @@ try:
     from babel import Locale  # type: ignore
 except ImportError:  # Babel not installed – we will fall back to a small mapping
     Locale = None
-from json.decoder import JSONDecodeError
 from pathlib import Path
 from typing import List
 
 import httpx
-from litellm import experimental_mcp_client
+
+try:
+    from litellm import experimental_mcp_client
+except ImportError:
+    experimental_mcp_client = None
 from litellm.types.utils import (
     ChatCompletionMessageToolCall,
     Choices,
@@ -38,7 +38,6 @@ from litellm.types.utils import (
     ModelResponse,
 )
 from prompt_toolkit.patch_stdout import patch_stdout
-from rich.console import Console
 
 from aider import __version__, models, prompts, urls, utils
 from aider.analytics import Analytics
@@ -48,7 +47,11 @@ from aider.history import ChatSummary
 from aider.io import ConfirmGroup, InputOutput
 from aider.linter import Linter
 from aider.llm import litellm
-from aider.mcp.server import LocalServer
+
+try:
+    from aider.mcp.server import LocalServer
+except ImportError:
+    LocalServer = None
 from aider.models import RETRY_TIMEOUT
 from aider.reasoning_tags import (
     REASONING_TAG,
@@ -63,6 +66,12 @@ from aider.utils import format_content, format_messages, format_tokens, is_image
 
 from ..dump import dump  # noqa: F401
 from .chat_chunks import ChatChunks
+from .domain.editor import EditorManager
+from .domain.file_manager import FileManager
+from .domain.outputs import OutputManager
+from .domain.response_parser import ResponseParser
+from .domain.runtime import RuntimeManager
+from .domain.tool_use import ToolUseManager
 
 
 class UnknownEditFormat(ValueError):
@@ -459,6 +468,11 @@ class Coder:
         self.shell_commands = []
         self.partial_response_tool_calls = []
 
+        # Initialize platform and os modules for domain managers
+        self.platform = platform
+        self.os = os
+        self.datetime = datetime
+
         if not auto_commits:
             dirty_commits = False
 
@@ -600,6 +614,14 @@ class Coder:
         self.auto_test = auto_test
         self.test_cmd = test_cmd
 
+        # Initialize domain managers first
+        self.runtime = RuntimeManager(self)
+        self.tool_use = ToolUseManager(self)
+        self.file_manager = FileManager(self)
+        self.outputs = OutputManager(self)
+        self.editor = EditorManager(self)
+        self.response_parser = ResponseParser(self)
+
         # Clean up todo list file on startup unless preserve_todo_list is True
         if not getattr(self, "preserve_todo_list", False):
             todo_file_path = ".aider.todo.txt"
@@ -633,58 +655,29 @@ class Coder:
             self.linter.set_linter(lang, cmd)
 
     def show_announcements(self):
-        bold = True
-        for line in self.get_announcements():
-            self.io.tool_output(line, bold=bold)
-            bold = False
+        self.outputs.show_announcements()
 
     def add_rel_fname(self, rel_fname):
-        self.abs_fnames.add(self.abs_root_path(rel_fname))
-        self.check_added_files()
+        return self.file_manager.add_rel_fname(rel_fname)
 
     def drop_rel_fname(self, fname):
-        abs_fname = self.abs_root_path(fname)
-        if abs_fname in self.abs_fnames:
-            self.abs_fnames.remove(abs_fname)
-            return True
+        return self.file_manager.drop_rel_fname(fname)
 
     def abs_root_path(self, path):
-        key = path
-        if key in self.abs_root_path_cache:
-            return self.abs_root_path_cache[key]
-
-        res = Path(self.root) / path
-        res = utils.safe_abs_path(res)
-        self.abs_root_path_cache[key] = res
-        return res
+        return self.file_manager.abs_root_path(path)
 
     fences = all_fences
     fence = fences[0]
 
     def show_pretty(self):
-        if not self.pretty:
-            return False
-
-        # only show pretty output if fences are the normal triple-backtick
-        if self.fence[0][0] != "`":
-            return False
-
-        return True
+        return self.outputs.show_pretty()
 
     def _stop_waiting_spinner(self):
         """Stop and clear the waiting spinner if it is running."""
-        self.io.stop_spinner()
+        self.runtime._stop_waiting_spinner()
 
     def get_abs_fnames_content(self):
-        for fname in list(self.abs_fnames):
-            content = self.io.read_text(fname)
-
-            if content is None:
-                relative_fname = self.get_rel_fname(fname)
-                self.io.tool_warning(f"Dropping {relative_fname} from the chat.")
-                self.abs_fnames.remove(fname)
-            else:
-                yield fname, content
+        yield from self.file_manager.get_abs_fnames_content()
 
     def choose_fence(self):
         all_content = ""
@@ -719,115 +712,10 @@ class Coder:
         return
 
     def get_files_content(self, fnames=None):
-        if not fnames:
-            fnames = self.abs_fnames
-
-        prompt = ""
-        for fname, content in self.get_abs_fnames_content():
-            if not is_image_file(fname):
-                relative_fname = self.get_rel_fname(fname)
-                prompt += "\n"
-                prompt += relative_fname
-                prompt += f"\n{self.fence[0]}\n"
-
-                # Apply context management if enabled for large files
-                if self.context_management_enabled:
-                    # Calculate tokens for this file
-                    file_tokens = self.main_model.token_count(content)
-
-                    if file_tokens > self.large_file_token_threshold:
-                        # Truncate the file content
-                        lines = content.splitlines()
-
-                        # Keep the first and last parts of the file with a marker in between
-                        keep_lines = (
-                            self.large_file_token_threshold // 40
-                        )  # Rough estimate of tokens per line
-                        first_chunk = lines[: keep_lines // 2]
-                        last_chunk = lines[-(keep_lines // 2) :]
-
-                        truncated_content = "\n".join(first_chunk)
-                        truncated_content += (
-                            f"\n\n... [File truncated due to size ({file_tokens} tokens). Use"
-                            " /context-management to toggle truncation off] ...\n\n"
-                        )
-                        truncated_content += "\n".join(last_chunk)
-
-                        # Add message about truncation
-                        self.io.tool_output(
-                            f"⚠️ '{relative_fname}' is very large ({file_tokens} tokens). "
-                            "Use /context-management to toggle truncation off if needed."
-                        )
-
-                        prompt += truncated_content
-                    else:
-                        prompt += content
-                else:
-                    prompt += content
-
-                prompt += f"{self.fence[1]}\n"
-
-        return prompt
+        return self.file_manager.get_files_content(fnames)
 
     def get_read_only_files_content(self):
-        prompt = ""
-        # Handle regular read-only files
-        for fname in self.abs_read_only_fnames:
-            content = self.io.read_text(fname)
-            if content is not None and not is_image_file(fname):
-                relative_fname = self.get_rel_fname(fname)
-                prompt += "\n"
-                prompt += relative_fname
-                prompt += f"\n{self.fence[0]}\n"
-
-                # Apply context management if enabled for large files (same as get_files_content)
-                if self.context_management_enabled:
-                    # Calculate tokens for this file
-                    file_tokens = self.main_model.token_count(content)
-
-                    if file_tokens > self.large_file_token_threshold:
-                        # Truncate the file content
-                        lines = content.splitlines()
-
-                        # Keep the first and last parts of the file with a marker in between
-                        keep_lines = (
-                            self.large_file_token_threshold // 40
-                        )  # Rough estimate of tokens per line
-                        first_chunk = lines[: keep_lines // 2]
-                        last_chunk = lines[-(keep_lines // 2) :]
-
-                        truncated_content = "\n".join(first_chunk)
-                        truncated_content += (
-                            f"\n\n... [File truncated due to size ({file_tokens} tokens). Use"
-                            " /context-management to toggle truncation off] ...\n\n"
-                        )
-                        truncated_content += "\n".join(last_chunk)
-
-                        # Add message about truncation
-                        self.io.tool_output(
-                            f"⚠️ '{relative_fname}' is very large ({file_tokens} tokens). "
-                            "Use /context-management to toggle truncation off if needed."
-                        )
-
-                        prompt += truncated_content
-                    else:
-                        prompt += content
-                else:
-                    prompt += content
-
-                prompt += f"{self.fence[1]}\n"
-
-        # Handle stub files
-        for fname in self.abs_read_only_stubs_fnames:
-            if not is_image_file(fname):
-                relative_fname = self.get_rel_fname(fname)
-                prompt += "\n"
-                prompt += f"{relative_fname} (stub)"
-                prompt += f"\n{self.fence[0]}\n"
-                stub = self.get_file_stub(fname)
-                prompt += stub
-                prompt += f"{self.fence[1]}\n"
-        return prompt
+        return self.file_manager.get_read_only_files_content()
 
     def get_cur_message_text(self):
         text = ""
@@ -1044,16 +932,7 @@ class Coder:
             yield chunk
 
     def init_before_message(self):
-        self.aider_edited_files = set()
-        self.reflected_message = None
-        self.num_reflections = 0
-        self.lint_outcome = None
-        self.test_outcome = None
-        self.shell_commands = []
-        self.message_cost = 0
-
-        if self.repo:
-            self.commit_before_message.append(self.repo.get_head_commit_sha())
+        self.runtime.init_before_message()
 
     async def run(self, with_message=None, preproc=True):
         while self.confirmation_in_progress:
@@ -1287,92 +1166,19 @@ class Coder:
         return inp
 
     def keyboard_interrupt(self):
-        # Ensure cursor is visible on exit
-        Console().show_cursor(True)
-
-        self.io.tool_warning("\n\n^C KeyboardInterrupt")
-
-        self.last_keyboard_interrupt = time.time()
+        self.runtime.keyboard_interrupt()
 
     def summarize_start(self):
-        if not self.summarizer.check_max_tokens(self.done_messages):
-            return
-
-        self.summarize_end()
-
-        if self.verbose:
-            self.io.tool_output("Starting to summarize chat history.")
-
-        self.summarizer_thread = threading.Thread(target=self.summarize_worker)
-        self.summarizer_thread.start()
+        self.runtime.summarize_start()
 
     def summarize_worker(self):
-        self.summarizing_messages = list(self.done_messages)
-        try:
-            self.summarized_done_messages = asyncio.run(
-                self.summarizer.summarize(self.summarizing_messages)
-            )
-        except ValueError as err:
-            self.io.tool_warning(err.args[0])
-            self.summarized_done_messages = self.summarizing_messages
-
-        if self.verbose:
-            self.io.tool_output("Finished summarizing chat history.")
+        self.runtime.summarize_worker()
 
     def summarize_end(self):
-        if self.summarizer_thread is None:
-            return
-
-        self.summarizer_thread.join()
-        self.summarizer_thread = None
-
-        if self.summarizing_messages == self.done_messages:
-            self.done_messages = self.summarized_done_messages
-        self.summarizing_messages = None
-        self.summarized_done_messages = []
+        self.runtime.summarize_end()
 
     async def compact_context_if_needed(self):
-        if not self.enable_context_compaction:
-            self.summarize_start()
-            return
-
-        if not self.summarizer.check_max_tokens(
-            self.done_messages, max_tokens=self.context_compaction_max_tokens
-        ):
-            return
-
-        self.io.tool_output("Compacting chat history to make room for new messages...")
-
-        try:
-            # Create a summary of the conversation
-            summary_text = await self.summarizer.summarize_all_as_text(
-                self.done_messages,
-                self.gpt_prompts.compaction_prompt,
-                self.context_compaction_summary_tokens,
-            )
-            if not summary_text:
-                raise ValueError("Summarization returned an empty result.")
-
-            # Replace old messages with the summary
-            self.done_messages = [
-                {
-                    "role": "user",
-                    "content": summary_text,
-                },
-                {
-                    "role": "assistant",
-                    "content": (
-                        "Ok, I will use this summary as the context for our conversation going"
-                        " forward."
-                    ),
-                },
-            ]
-            self.io.tool_output("...chat history compacted.")
-        except Exception as e:
-            self.io.tool_warning(f"Context compaction failed: {e}")
-            self.io.tool_warning("Proceeding with full history for now.")
-            self.summarize_start()
-            return
+        await self.runtime.compact_context_if_needed()
 
     def move_back_cur_messages(self, message):
         self.done_messages += self.cur_messages
@@ -1465,51 +1271,7 @@ class Coder:
         return None
 
     def get_platform_info(self):
-        platform_text = ""
-        try:
-            platform_text = f"- Platform: {platform.platform()}\n"
-        except KeyError:
-            # Skip platform info if it can't be retrieved
-            platform_text = "- Platform information unavailable\n"
-
-        shell_var = "COMSPEC" if os.name == "nt" else "SHELL"
-        shell_val = os.getenv(shell_var)
-        platform_text += f"- Shell: {shell_var}={shell_val}\n"
-
-        user_lang = self.get_user_language()
-        if user_lang:
-            platform_text += f"- Language: {user_lang}\n"
-
-        dt = datetime.now().astimezone().strftime("%Y-%m-%d")
-        platform_text += f"- Current date: {dt}\n"
-
-        if self.repo:
-            platform_text += "- The user is operating inside a git repository\n"
-
-        if self.lint_cmds:
-            if self.auto_lint:
-                platform_text += (
-                    "- The user's pre-commit runs these lint commands, don't suggest running"
-                    " them:\n"
-                )
-            else:
-                platform_text += "- The user prefers these lint commands:\n"
-            for lang, cmd in self.lint_cmds.items():
-                if lang is None:
-                    platform_text += f"  - {cmd}\n"
-                else:
-                    platform_text += f"  - {lang}: {cmd}\n"
-
-        if self.test_cmd:
-            if self.auto_test:
-                platform_text += (
-                    "- The user's pre-commit runs this test command, don't suggest running them: "
-                )
-            else:
-                platform_text += "- The user prefers this test command: "
-            platform_text += self.test_cmd + "\n"
-
-        return platform_text
+        return self.outputs.get_platform_info()
 
     def fmt_system_prompt(self, prompt):
         final_reminders = []
@@ -1696,60 +1458,7 @@ class Coder:
         return chunks
 
     def warm_cache(self, chunks):
-        if not self.add_cache_headers:
-            return
-        if not self.num_cache_warming_pings:
-            return
-        if not self.ok_to_warm_cache:
-            return
-
-        delay = 5 * 60 - 5
-        delay = float(os.environ.get("AIDER_CACHE_KEEPALIVE_DELAY", delay))
-        self.next_cache_warm = time.time() + delay
-        self.warming_pings_left = self.num_cache_warming_pings
-        self.cache_warming_chunks = chunks
-
-        if self.cache_warming_thread:
-            return
-
-        def warm_cache_worker():
-            while self.ok_to_warm_cache:
-                time.sleep(1)
-                if self.warming_pings_left <= 0:
-                    continue
-                now = time.time()
-                if now < self.next_cache_warm:
-                    continue
-
-                self.warming_pings_left -= 1
-                self.next_cache_warm = time.time() + delay
-
-                kwargs = dict(self.main_model.extra_params) or dict()
-                kwargs["max_tokens"] = 1
-
-                try:
-                    completion = litellm.completion(
-                        model=self.main_model.name,
-                        messages=self.cache_warming_chunks.cacheable_messages(),
-                        stream=False,
-                        **kwargs,
-                    )
-                except Exception as err:
-                    self.io.tool_warning(f"Cache warming error: {str(err)}")
-                    continue
-
-                cache_hit_tokens = getattr(
-                    completion.usage, "prompt_cache_hit_tokens", 0
-                ) or getattr(completion.usage, "cache_read_input_tokens", 0)
-
-                if self.verbose:
-                    self.io.tool_output(f"Warmed {format_tokens(cache_hit_tokens)} cached tokens.")
-
-        self.cache_warming_thread = threading.Timer(0, warm_cache_worker)
-        self.cache_warming_thread.daemon = True
-        self.cache_warming_thread.start()
-
-        return chunks
+        return self.runtime.warm_cache(chunks)
 
     def check_tokens(self, messages):
         """Check if the messages will fit within the model's token limits."""
@@ -2369,57 +2078,7 @@ class Coder:
         pass
 
     def show_exhausted_error(self):
-        output_tokens = 0
-        if self.partial_response_content:
-            output_tokens = self.main_model.token_count(self.partial_response_content)
-        max_output_tokens = self.main_model.info.get("max_output_tokens") or 0
-
-        input_tokens = self.main_model.token_count(self.format_messages().all_messages())
-        max_input_tokens = self.main_model.info.get("max_input_tokens") or 0
-
-        total_tokens = input_tokens + output_tokens
-
-        fudge = 0.7
-
-        out_err = ""
-        if output_tokens >= max_output_tokens * fudge:
-            out_err = " -- possibly exceeded output limit!"
-
-        inp_err = ""
-        if input_tokens >= max_input_tokens * fudge:
-            inp_err = " -- possibly exhausted context window!"
-
-        tot_err = ""
-        if total_tokens >= max_input_tokens * fudge:
-            tot_err = " -- possibly exhausted context window!"
-
-        res = ["", ""]
-        res.append(f"Model {self.main_model.name} has hit a token limit!")
-        res.append("Token counts below are approximate.")
-        res.append("")
-        res.append(f"Input tokens: ~{input_tokens:,} of {max_input_tokens:,}{inp_err}")
-        res.append(f"Output tokens: ~{output_tokens:,} of {max_output_tokens:,}{out_err}")
-        res.append(f"Total tokens: ~{total_tokens:,} of {max_input_tokens:,}{tot_err}")
-
-        if output_tokens >= max_output_tokens:
-            res.append("")
-            res.append("To reduce output tokens:")
-            res.append("- Ask for smaller changes in each request.")
-            res.append("- Break your code into smaller source files.")
-            if "diff" not in self.main_model.edit_format:
-                res.append("- Use a stronger model that can return diffs.")
-
-        if input_tokens >= max_input_tokens or total_tokens >= max_input_tokens:
-            res.append("")
-            res.append("To reduce input tokens:")
-            res.append("- Use /tokens to see token usage.")
-            res.append("- Use /drop to remove unneeded files from the chat session.")
-            res.append("- Use /clear to clear the chat history.")
-            res.append("- Break your code into smaller source files.")
-
-        res = "".join([line + "\n" for line in res])
-        self.io.tool_error(res)
-        self.io.offer_url(urls.token_limits)
+        self.outputs.show_exhausted_error()
 
     def lint_edited(self, fnames):
         res = ""
@@ -2951,13 +2610,7 @@ class Coder:
         self.usage_report = tokens_report + sep + cost_report
 
     def format_cost(self, value):
-        if value == 0:
-            return "0.00"
-        magnitude = abs(value)
-        if magnitude >= 0.01:
-            return f"{value:.2f}"
-        else:
-            return f"{value:.{max(2, 2 - int(math.log10(magnitude)))}f}"
+        return self.outputs.format_cost(value)
 
     def compute_costs_from_tokens(
         self, prompt_tokens, completion_tokens, cache_write_tokens, cache_hit_tokens
@@ -2992,30 +2645,7 @@ class Coder:
         return cost
 
     def show_usage_report(self):
-        if not self.usage_report:
-            return
-
-        self.total_tokens_sent += self.message_tokens_sent
-        self.total_tokens_received += self.message_tokens_received
-
-        self.io.tool_output(self.usage_report)
-
-        prompt_tokens = self.message_tokens_sent
-        completion_tokens = self.message_tokens_received
-        self.event(
-            "message_send",
-            main_model=self.main_model,
-            edit_format=self.edit_format,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            cost=self.message_cost,
-            total_cost=self.total_cost,
-        )
-
-        self.message_cost = 0.0
-        self.message_tokens_sent = 0
-        self.message_tokens_received = 0
+        self.outputs.show_usage_report()
 
     def get_multi_response_content_in_progress(self, final=False):
         cur = self.multi_response_content or ""
@@ -3085,55 +2715,7 @@ class Coder:
         self.need_commit_before_edits.add(path)
 
     async def allowed_to_edit(self, path):
-        full_path = self.abs_root_path(path)
-        if self.repo:
-            need_to_add = not self.repo.path_in_repo(path)
-        else:
-            need_to_add = False
-
-        if full_path in self.abs_fnames:
-            self.check_for_dirty_commit(path)
-            return True
-
-        if self.repo and self.repo.git_ignored_file(path):
-            self.io.tool_warning(f"Skipping edits to {path} that matches gitignore spec.")
-            return
-
-        if not Path(full_path).exists():
-            if not self.io.confirm_ask("Create new file?", subject=path):
-                self.io.tool_output(f"Skipping edits to {path}")
-                return
-
-            if not self.dry_run:
-                if not utils.touch_file(full_path):
-                    self.io.tool_error(f"Unable to create {path}, skipping edits.")
-                    return
-
-                # Seems unlikely that we needed to create the file, but it was
-                # actually already part of the repo.
-                # But let's only add if we need to, just to be safe.
-                if need_to_add:
-                    self.repo.repo.git.add(full_path)
-
-            self.abs_fnames.add(full_path)
-            self.check_added_files()
-            return True
-
-        if not await self.io.confirm_ask(
-            "Allow edits to file that has not been added to the chat?",
-            subject=path,
-        ):
-            self.io.tool_output(f"Skipping edits to {path}")
-            return
-
-        if need_to_add:
-            self.repo.repo.git.add(full_path)
-
-        self.abs_fnames.add(full_path)
-        self.check_added_files()
-        self.check_for_dirty_commit(path)
-
-        return True
+        return await self.editor.allowed_to_edit(path)
 
     warning_given = False
 
@@ -3163,31 +2745,7 @@ class Coder:
         self.warning_given = True
 
     async def prepare_to_edit(self, edits):
-        res = []
-        seen = dict()
-
-        self.need_commit_before_edits = set()
-
-        for edit in edits:
-            path = edit[0]
-            if path is None:
-                res.append(edit)
-                continue
-            if path == "python":
-                dump(edits)
-            if path in seen:
-                allowed = seen[path]
-            else:
-                allowed = await self.allowed_to_edit(path)
-                seen[path] = allowed
-
-            if allowed:
-                res.append(edit)
-
-        self.dirty_commit()
-        self.need_commit_before_edits = set()
-
-        return res
+        return await self.editor.prepare_to_edit(edits)
 
     async def apply_updates(self):
         edited = set()
@@ -3230,31 +2788,7 @@ class Coder:
         return edited
 
     def parse_partial_args(self):
-        # dump(self.partial_response_function_call)
-
-        data = self.partial_response_function_call.get("arguments")
-        if not data:
-            return
-
-        try:
-            return json.loads(data)
-        except JSONDecodeError:
-            pass
-
-        try:
-            return json.loads(data + "]}")
-        except JSONDecodeError:
-            pass
-
-        try:
-            return json.loads(data + "}]}")
-        except JSONDecodeError:
-            pass
-
-        try:
-            return json.loads(data + '"}]}')
-        except JSONDecodeError:
-            pass
+        return self.response_parser.parse_partial_args()
 
     def _find_occurrences(self, content, pattern, near_context=None):
         """Find all occurrences of pattern, optionally filtered by near_context."""
@@ -3281,63 +2815,19 @@ class Coder:
     # commits...
 
     def get_context_from_history(self, history):
-        context = ""
-        if history:
-            for msg in history:
-                msg_content = msg.get("content") or ""
-                context += "\n" + msg["role"].upper() + ": " + msg_content + "\n"
-
-        return context
+        return self.editor.get_context_from_history(history)
 
     def auto_commit(self, edited, context=None):
-        if not self.repo or not self.auto_commits or self.dry_run:
-            return
-
-        if not context:
-            context = self.get_context_from_history(self.cur_messages)
-
-        try:
-            res = self.repo.commit(fnames=edited, context=context, aider_edits=True, coder=self)
-            if res:
-                self.show_auto_commit_outcome(res)
-                commit_hash, commit_message = res
-                return self.gpt_prompts.files_content_gpt_edits.format(
-                    hash=commit_hash,
-                    message=commit_message,
-                )
-
-            return self.gpt_prompts.files_content_gpt_no_edits
-        except ANY_GIT_ERROR as err:
-            self.io.tool_error(f"Unable to commit: {str(err)}")
-            return
+        return self.editor.auto_commit(edited, context)
 
     def show_auto_commit_outcome(self, res):
-        commit_hash, commit_message = res
-        self.last_aider_commit_hash = commit_hash
-        self.aider_commit_hashes.add(commit_hash)
-        self.last_aider_commit_message = commit_message
-        if self.show_diffs:
-            self.commands.cmd_diff()
+        self.outputs.show_auto_commit_outcome(res)
 
     def show_undo_hint(self):
-        if not self.commit_before_message:
-            return
-        if self.commit_before_message[-1] != self.repo.get_head_commit_sha():
-            self.io.tool_output("You can use /undo to undo and discard each aider commit.")
+        self.outputs.show_undo_hint()
 
     def dirty_commit(self):
-        if not self.need_commit_before_edits:
-            return
-        if not self.dirty_commits:
-            return
-        if not self.repo:
-            return
-
-        self.repo.commit(fnames=self.need_commit_before_edits, coder=self)
-
-        # files changed, move cur messages back behind the files messages
-        # self.move_back_cur_messages(self.gpt_prompts.files_content_local_edits)
-        return True
+        return self.editor.dirty_commit()
 
     def get_edits(self, mode="update"):
         return []
