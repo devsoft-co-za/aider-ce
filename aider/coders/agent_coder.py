@@ -1936,6 +1936,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
         # NEW: Binary file detection (before reading content)
         try:
             from binaryornot.check import is_binary
+
             if is_binary(abs_path):
                 if not self.skip_cli_confirmations:
                     confirmed = await self.io.confirm_ask(
