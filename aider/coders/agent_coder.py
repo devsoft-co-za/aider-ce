@@ -1812,6 +1812,37 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                 return "File already in context as read-only"
             return "File already in context as read-only"
 
+        # NEW: File extension filtering for known binary/image files
+        # Common binary and image file extensions that should not be sent to LLM
+        binary_extensions = {
+            # Image formats
+            '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.ico', '.svg',
+            # Audio/video formats
+            '.mp3', '.mp4', '.avi', '.mov', '.wav', '.flac', '.ogg', '.m4a', '.wmv', '.mkv',
+            # Archive formats
+            '.zip', '.tar', '.gz', '.rar', '.7z', '.bz2',
+            # Binary/document formats
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            # Executable formats
+            '.exe', '.dll', '.so', '.dylib', '.bin',
+            # Database files
+            '.db', '.sqlite', '.mdb',
+            # Other binary formats
+            '.pyc', '.class', '.o', '.obj'
+        }
+        
+        file_ext = os.path.splitext(rel_path.lower())[1]
+        if file_ext in binary_extensions:
+            if not self.skip_cli_confirmations:
+                confirmed = await self.io.confirm_ask(
+                    f"File '{rel_path}' has a binary file extension ({file_ext}). Add to context anyway?"
+                )
+                if not confirmed:
+                    return "Binary file skipped (extension)"
+            else:
+                self.io.tool_warning(f"Skipping binary file by extension: {rel_path}")
+                return "Binary file skipped (extension)"
+
         # NEW: File size pre-check (before reading content)
         try:
             file_size = os.path.getsize(abs_path)
@@ -1857,10 +1888,48 @@ Just reply with fixed versions of the {blocks} above that failed to match.
 
         # Add file to context as read-only
         try:
+            # Final safety check: try to read a small portion to detect encoding issues
+            try:
+                with open(abs_path, 'rb') as f:
+                    sample = f.read(4096)  # Read first 4KB
+                    # Try to decode as UTF-8 to check if it's valid text
+                    try:
+                        sample.decode('utf-8')
+                    except UnicodeDecodeError:
+                        # File is likely binary - double check with our binary detection
+                        if not self.skip_cli_confirmations:
+                            confirmed = await self.io.confirm_ask(
+                                f"File '{rel_path}' appears to contain binary data. Add to context anyway?"
+                            )
+                            if not confirmed:
+                                return "Binary file skipped (encoding check)"
+                        else:
+                            self.io.tool_warning(f"Skipping binary file (encoding check): {rel_path}")
+                            return "Binary file skipped (encoding check)"
+            except Exception as e:
+                self.io.tool_warning(f"Error during encoding check for '{rel_path}': {e}")
+                # Continue anyway if encoding check fails
+
             # Check for large file and apply context management if enabled
             content = self.io.read_text(abs_path)
             if content is None:
                 return f"Error reading file: {file_path}"
+
+            # Additional check: if content contains a high percentage of non-printable characters
+            # This catches cases where binary files might slip through previous checks
+            if len(content) > 0:
+                printable_chars = sum(1 for c in content if c.isprintable() or c in '\t\n\r')
+                printable_ratio = printable_chars / len(content)
+                if printable_ratio < 0.7:  # Less than 70% printable characters
+                    if not self.skip_cli_confirmations:
+                        confirmed = await self.io.confirm_ask(
+                            f"File '{rel_path}' contains mostly non-printable characters. Add to context anyway?"
+                        )
+                        if not confirmed:
+                            return "Binary file skipped (non-printable content)"
+                    else:
+                        self.io.tool_warning(f"Skipping binary file (non-printable content): {rel_path}")
+                        return "Binary file skipped (non-printable content)"
 
             # Check if file is very large and context management is enabled
             if self.context_management_enabled:
