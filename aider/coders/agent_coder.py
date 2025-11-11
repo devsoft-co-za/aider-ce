@@ -1841,7 +1841,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                 return "File already in context as read-only"
             return "File already in context as read-only"
 
-        # NEW: File extension filtering for known binary/image files
+        # File extension filtering for known binary/image files
         # Common binary and image file extensions that should not be sent to LLM
         binary_extensions = {
             # Image formats
@@ -1922,7 +1922,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                 self.io.tool_warning(f"Skipping binary file by extension: {rel_path}")
                 return "Binary file skipped (extension)"
 
-        # NEW: File size pre-check (before reading content)
+        # File size pre-check (before reading content)
         try:
             file_size = os.path.getsize(abs_path)
             max_file_size_bytes = getattr(self, "max_file_size_bytes", 1024 * 1024)  # Default 1MB
@@ -1933,7 +1933,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
             self.io.tool_warning(f"Could not check file size for '{rel_path}': {e}")
             return "Error checking file size"
 
-        # NEW: Binary file detection (before reading content)
+        # Binary file detection (before reading content)
         try:
             from binaryornot.check import is_binary
 
