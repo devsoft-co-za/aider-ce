@@ -1809,25 +1809,29 @@ Just reply with fixed versions of the {blocks} above that failed to match.
         from aider.utils import is_image_file
 
         if is_image_file(rel_path):
+            self.io.tool_output(f"🔍 DEBUG: Image file detected: {rel_path}")
             if self.main_model.info.get("supports_vision"):
                 # Model supports vision - allow image files through without binary filtering
                 # Skip all binary detection for vision-capable models
+                self.io.tool_output(f"✅ DEBUG: Model {self.main_model.name} supports vision - allowing image file")
                 pass
             else:
                 # Model doesn't support vision - apply binary filtering to image files
+                self.io.tool_output(f"❌ DEBUG: Model {self.main_model.name} does NOT support vision")
                 if not self.skip_cli_confirmations:
                     confirmed = await self.io.confirm_ask(
                         f"File '{rel_path}' is an image file but the model"
                         f" {self.main_model.name} does not support images. Add to context anyway?"
                     )
                     if not confirmed:
+                        self.io.tool_output(f"🔍 DEBUG: User skipped image file: {rel_path}")
                         return "Image file skipped (model doesn't support vision)"
                 else:
                     self.io.tool_warning(
                         f"Skipping image file (model doesn't support vision): {rel_path}"
                     )
+                    self.io.tool_output(f"🔍 DEBUG: Auto-skipped image file: {rel_path}")
                     return "Image file skipped (model doesn't support vision)"
-
         # Check if the file is already in context (either editable or read-only)
         if abs_path in self.abs_fnames:
             if explicit:
@@ -1899,22 +1903,11 @@ Just reply with fixed versions of the {blocks} above that failed to match.
         }
 
         file_ext = os.path.splitext(rel_path.lower())[1]
+        self.io.tool_output(f"🔍 DEBUG: File extension: {file_ext}")
         if file_ext in binary_extensions:
             if not self.skip_cli_confirmations:
                 confirmed = await self.io.confirm_ask(
                     f"File '{rel_path}' has a binary file extension ({file_ext}). Add to context"
-                    " anyway?"
-                )
-                if not confirmed:
-                    return "Binary file skipped (extension)"
-            else:
-                self.io.tool_warning(f"Skipping binary file by extension: {rel_path}")
-                return "Binary file skipped (extension)"
-        if file_ext in binary_extensions:
-            if not self.skip_cli_confirmations:
-                confirmed = await self.io.confirm_ask(
-                    f"File '{rel_path}' has a binary file extension ({file_ext}). Add to context"
-                    " anyway?"
                 )
                 if not confirmed:
                     return "Binary file skipped (extension)"
