@@ -243,6 +243,8 @@ class AgentCoder(Coder):
         # Set defaults for missing values
         if "large_file_token_threshold" not in config:
             config["large_file_token_threshold"] = 25000
+        if "max_file_size_bytes" not in config:
+            config["max_file_size_bytes"] = 1024 * 1024  # 1MB default
         if "tools_includelist" not in config:
             config["tools_includelist"] = []
         if "tools_excludelist" not in config:
@@ -250,6 +252,7 @@ class AgentCoder(Coder):
 
         # Apply configuration to instance
         self.large_file_token_threshold = config["large_file_token_threshold"]
+        self.max_file_size_bytes = config["max_file_size_bytes"]
         self.skip_cli_confirmations = config.get(
             "skip_cli_confirmations", config.get("yolo", False)
         )
@@ -323,9 +326,15 @@ class AgentCoder(Coder):
                     for params in parsed_args_list:
                         # Use the process_response function from the tool module
                         result = tool_module.process_response(self, params)
-                        # Handle async functions
+                        # Handle async functions and methods that became async
                         if asyncio.iscoroutine(result):
                             tasks.append(result)
+                        elif callable(result) and hasattr(result, '__self__'):
+                            # Check if this is calling _add_file_to_context which is now async
+                            if hasattr(result.__self__, '_add_file_to_context'):
+                                tasks.append(result())
+                            else:
+                                tasks.append(asyncio.to_thread(lambda: result))
                         else:
                             tasks.append(asyncio.to_thread(lambda: result))
                 else:
@@ -1139,6 +1148,10 @@ class AgentCoder(Coder):
                 # Handle async functions
                 if asyncio.iscoroutine(result):
                     result = await result
+                # Handle methods that were made async (like _add_file_to_context)
+                elif callable(result) and hasattr(result, '__self__') and hasattr(result.__self__, '_add_file_to_context'):
+                    # This handles the case where _add_file_to_context is now async
+                    result = await result
                 return result
             except Exception as e:
                 self.io.tool_error(
@@ -1770,7 +1783,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
 
         return edited_files
 
-    def _add_file_to_context(self, file_path, explicit=False):
+    async def _add_file_to_context(self, file_path, explicit=False):
         """
         Helper method to add a file to context as read-only.
 
@@ -1798,6 +1811,49 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                 self.io.tool_output(f"📎 File '{file_path}' already in context as read-only")
                 return "File already in context as read-only"
             return "File already in context as read-only"
+
+        # NEW: File size pre-check (before reading content)
+        try:
+            file_size = os.path.getsize(abs_path)
+            max_file_size_bytes = getattr(self, 'max_file_size_bytes', 1024 * 1024)  # Default 1MB
+            if file_size > max_file_size_bytes:
+                self.io.tool_warning(f"File '{rel_path}' is too large ({file_size} bytes)")
+                return "File too large for context"
+        except OSError as e:
+            self.io.tool_warning(f"Could not check file size for '{rel_path}': {e}")
+            return "Error checking file size"
+
+        # NEW: Binary file detection (before reading content)
+        try:
+            from binaryornot.check import is_binary
+            if is_binary(abs_path):
+                if not self.skip_cli_confirmations:
+                    confirmed = await self.io.confirm_ask(
+                        f"File '{rel_path}' appears to be binary. Add to context anyway?"
+                    )
+                    if not confirmed:
+                        return "Binary file skipped"
+                else:
+                    self.io.tool_warning(f"Skipping binary file: {rel_path}")
+                    return "Binary file skipped"
+        except ImportError:
+            # Fallback binary detection if binaryornot is not available
+            try:
+                with open(abs_path, 'rb') as f:
+                    chunk = f.read(1024)
+                    if b'\0' in chunk:  # Simple null-byte detection
+                        if not self.skip_cli_confirmations:
+                            confirmed = await self.io.confirm_ask(
+                                f"File '{rel_path}' appears to be binary (contains null bytes). Add to context anyway?"
+                            )
+                            if not confirmed:
+                                return "Binary file skipped"
+                        else:
+                            self.io.tool_warning(f"Skipping binary file: {rel_path}")
+                            return "Binary file skipped"
+            except Exception as e:
+                self.io.tool_warning(f"Error during binary detection for '{rel_path}': {e}")
+                # Continue anyway if we can't determine if it's binary
 
         # Add file to context as read-only
         try:
