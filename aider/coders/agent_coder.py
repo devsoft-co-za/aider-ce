@@ -59,17 +59,6 @@ from aider.tools import (
 from .agent_prompts import AgentPrompts
 from .base_coder import ChatChunks, Coder
 from .editblock_coder import do_replace, find_original_update_blocks, find_similar_lines
-    show_numbered_context,
-    undo_change,
-    update_todo_list,
-    view,
-    view_files_matching,
-    view_files_with_symbol,
-)
-
-from .agent_prompts import AgentPrompts
-from .base_coder import ChatChunks, Coder
-from .editblock_coder import do_replace, find_original_update_blocks, find_similar_lines
 
 
 class AgentCoder(Coder):
@@ -1818,7 +1807,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
         # FIRST: Check if this is an image file and if the model supports vision
         # If model supports vision, allow image files through without binary filtering
         from aider.utils import is_image_file
-        
+
         if is_image_file(rel_path):
             if self.main_model.info.get("supports_vision"):
                 # Model supports vision - allow image files through without binary filtering
@@ -1946,6 +1935,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
 
         # NEW: Binary file detection (before reading content)
         try:
+            from binaryornot.check import is_binary
             if is_binary(abs_path):
                 if not self.skip_cli_confirmations:
                     confirmed = await self.io.confirm_ask(
