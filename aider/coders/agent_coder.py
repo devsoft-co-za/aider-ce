@@ -59,6 +59,17 @@ from aider.tools import (
 from .agent_prompts import AgentPrompts
 from .base_coder import ChatChunks, Coder
 from .editblock_coder import do_replace, find_original_update_blocks, find_similar_lines
+    show_numbered_context,
+    undo_change,
+    update_todo_list,
+    view,
+    view_files_matching,
+    view_files_with_symbol,
+)
+
+from .agent_prompts import AgentPrompts
+from .base_coder import ChatChunks, Coder
+from .editblock_coder import do_replace, find_original_update_blocks, find_similar_lines
 
 
 class AgentCoder(Coder):
@@ -1804,6 +1815,31 @@ Just reply with fixed versions of the {blocks} above that failed to match.
             return "File not found"
 
         # Check if the file is already in context (either editable or read-only)
+        # FIRST: Check if this is an image file and if the model supports vision
+        # If model supports vision, allow image files through without binary filtering
+        from aider.utils import is_image_file
+        
+        if is_image_file(rel_path):
+            if self.main_model.info.get("supports_vision"):
+                # Model supports vision - allow image files through without binary filtering
+                # Skip all binary detection for vision-capable models
+                pass
+            else:
+                # Model doesn't support vision - apply binary filtering to image files
+                if not self.skip_cli_confirmations:
+                    confirmed = await self.io.confirm_ask(
+                        f"File '{rel_path}' is an image file but the model"
+                        f" {self.main_model.name} does not support images. Add to context anyway?"
+                    )
+                    if not confirmed:
+                        return "Image file skipped (model doesn't support vision)"
+                else:
+                    self.io.tool_warning(
+                        f"Skipping image file (model doesn't support vision): {rel_path}"
+                    )
+                    return "Image file skipped (model doesn't support vision)"
+
+        # Check if the file is already in context (either editable or read-only)
         if abs_path in self.abs_fnames:
             if explicit:
                 self.io.tool_output(f"📎 File '{file_path}' already in context as editable")
@@ -1885,6 +1921,17 @@ Just reply with fixed versions of the {blocks} above that failed to match.
             else:
                 self.io.tool_warning(f"Skipping binary file by extension: {rel_path}")
                 return "Binary file skipped (extension)"
+        if file_ext in binary_extensions:
+            if not self.skip_cli_confirmations:
+                confirmed = await self.io.confirm_ask(
+                    f"File '{rel_path}' has a binary file extension ({file_ext}). Add to context"
+                    " anyway?"
+                )
+                if not confirmed:
+                    return "Binary file skipped (extension)"
+            else:
+                self.io.tool_warning(f"Skipping binary file by extension: {rel_path}")
+                return "Binary file skipped (extension)"
 
         # NEW: File size pre-check (before reading content)
         try:
@@ -1899,8 +1946,6 @@ Just reply with fixed versions of the {blocks} above that failed to match.
 
         # NEW: Binary file detection (before reading content)
         try:
-            from binaryornot.check import is_binary
-
             if is_binary(abs_path):
                 if not self.skip_cli_confirmations:
                     confirmed = await self.io.confirm_ask(
