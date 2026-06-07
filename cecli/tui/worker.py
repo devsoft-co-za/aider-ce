@@ -36,6 +36,24 @@ class CoderWorker:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.running = False
 
+        # Capture the TUI's main event loop for dispatching MCP tool calls.
+        # The CoderWorker creates a NEW event loop in _run_thread(), but MCP
+        # sessions are initialized on the TUI's loop (asyncio.StreamReader/Writer
+        # affinity).  Stashing the TUI loop allows _execute_mcp_tools to
+        # dispatch call_openai_tool() to the correct loop.
+        try:
+            self.tui_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.tui_loop = None
+
+        # Pass the TUI event loop to the coder so _execute_mcp_tools can use it
+        if self.tui_loop is not None:
+            self.coder._tui_event_loop = self.tui_loop
+        elif hasattr(self.coder, '_tui_event_loop'):
+            # If the coder already has one from a previous worker, keep it
+            self.tui_loop = self.coder._tui_event_loop
+        else:
+            self.tui_loop = None
     def start(self):
         """Start the worker thread."""
         self.running = True
@@ -164,8 +182,15 @@ class CoderWorker:
 
             # Cancel any tracked generate task on the coder directly
             if hasattr(target_coder, "interrupt_event") and target_coder.interrupt_event:
-                target_coder.interrupt_event.set()
-
+                # Use call_soon_threadsafe to set the event on the worker's event loop.
+                # Directly calling event.set() from another thread is unsafe because
+                # it calls Future.set_result() -> loop.call_soon() which is not
+                # thread-safe. call_soon_threadsafe() ensures the callback is
+                # properly scheduled on the worker's event loop.
+                if self.loop and self.loop.is_running():
+                    self.loop.call_soon_threadsafe(target_coder.interrupt_event.set)
+                else:
+                    target_coder.interrupt_event.set()
     def stop(self):
         """Stop the worker thread gracefully."""
         self.running = False

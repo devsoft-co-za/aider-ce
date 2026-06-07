@@ -2819,11 +2819,27 @@ class Coder(metaclass=UsageMeta):
                             continue
 
                         async def do_tool_call():
+                            # MCP sessions are initialized on the TUI's event loop,
+                            # but in TUI mode the Coder runs on a background thread
+                            # with its own event loop (see CoderWorker._run_thread).
+                            # The asyncio.StreamReader/Writer from stdio_client()
+                            # are bound to the TUI's loop, so direct await on
+                            # Thread-4's loop causes an I/O affinity hang.
+                            # Dispatch the call to the TUI loop when available.
+                            tui_loop = getattr(self, '_tui_event_loop', None)
+                            if tui_loop and tui_loop is not asyncio.get_running_loop():
+                                future = asyncio.run_coroutine_threadsafe(
+                                    experimental_mcp_client.call_openai_tool(
+                                        session=session,
+                                        openai_tool=new_tool_call,
+                                    ),
+                                    tui_loop,
+                                )
+                                return await asyncio.wrap_future(future)
                             return await experimental_mcp_client.call_openai_tool(
                                 session=session,
                                 openai_tool=new_tool_call,
                             )
-
                         call_result, interrupted = await coroutines.interruptible(
                             do_tool_call(), self.interrupt_event
                         )
