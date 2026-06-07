@@ -2737,6 +2737,7 @@ class Coder(metaclass=UsageMeta):
         return None
 
     async def _execute_tool_groups(self, tool_groups):
+        _coder_debug(f"_execute_tool_groups: ENTER servers={list(tool_groups.keys())}")
         """Execute all tool groups."""
         all_responses = {}
 
@@ -2929,6 +2930,7 @@ class Coder(metaclass=UsageMeta):
         if tool_groups:
             self._print_tool_call_info(server_tool_calls=tool_groups)
 
+        _coder_debug("process_tool_calls: before confirm_ask")
         # 4. Ask for user confirmation
         if not await self.io.confirm_ask("Run tools?", group_response="Run MCP Tools"):
             return False
