@@ -2348,25 +2348,11 @@ class Coder(metaclass=UsageMeta):
         ConversationService.get_manager(self).decrement_message_markers()
         import asyncio
 
-        loop = asyncio.get_running_loop()
+        # Call format_messages directly instead of via run_in_executor to avoid
+        # non-cancellable thread deadlocks in background thread contexts (TUI mode).
+        # The synchronous operation completes quickly without needing a thread pool.
 
-        async def format_in_executor():
-            return await loop.run_in_executor(None, self.format_messages)
-
-        result, interrupted = await self.coroutines.interruptible(
-            format_in_executor(), self.interrupt_event
-        )
-
-        if interrupted:
-            # Use CancelledError instead of KeyboardInterrupt to avoid
-            # propagating through the asyncio event loop during cleanup.
-            # KeyboardInterrupt is re-raised by Task.__step and bypasses
-            # asyncio.gather(return_exceptions=True), causing crashes
-            # when tasks are gathered during _cleanup_loop.
-            raise asyncio.CancelledError("Interrupted during message formatting")
-
-        messages = result
-
+        messages = self.format_messages()
         if not await self.check_tokens(messages):
             return
 
