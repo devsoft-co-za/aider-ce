@@ -2921,9 +2921,11 @@ class Coder(metaclass=UsageMeta):
             return False
 
         # 2. Group by executor
+        _coder_debug("process_tool_calls: grouping tools")
         tool_groups = self._group_tools_by_executor(prepared_calls)
 
         # 3. Print tool call information
+        _coder_debug(f"process_tool_calls: tool_groups={dict(tool_groups) if tool_groups else None}")
         if tool_groups:
             self._print_tool_call_info(server_tool_calls=tool_groups)
 
