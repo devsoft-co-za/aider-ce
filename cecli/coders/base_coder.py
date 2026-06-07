@@ -12,6 +12,23 @@ import platform
 import re
 import sys
 import threading
+
+
+# --- CoderWorker thread debug logger ---
+# sys.settrace (used by --debug) only traces the main thread, so we need
+# this to see what the background CoderWorker thread is actually doing.
+_coder_debug_log_file = None
+_coder_debug_log_lock = threading.Lock()
+
+def _coder_debug(msg: str) -> None:
+    global _coder_debug_log_file
+    with _coder_debug_log_lock:
+        if _coder_debug_log_file is None:
+            import os as _os
+            _os.makedirs(".cecli/logs", exist_ok=True)
+            _coder_debug_log_file = open(".cecli/logs/coder-debug.log", "a", buffering=1)
+        _coder_debug_log_file.write(f"{time.time()} [{threading.current_thread().name}] {msg}\n")
+
 import time
 import traceback
 import weakref
@@ -1729,6 +1746,7 @@ class Coder(metaclass=UsageMeta):
 
     async def run_one(self, user_message, preproc):
         self.init_before_message()
+        _coder_debug(f"run_one: ENTER msg={user_message!r}")
 
         if not await HookIntegration.call_start_hooks(self):
             self.io.tool_warning("Execution stopped by start hook")
@@ -2330,6 +2348,7 @@ class Coder(metaclass=UsageMeta):
         # Clear any stale interrupt state before starting formatting
         # to avoid immediately re-catching a previous interrupt
         self.interrupt_event.clear()
+        _coder_debug(f"send_message: ENTER inp={inp!r}")
 
         if inp:
             # Make sure current coder actually has control of conversation system
@@ -2353,6 +2372,7 @@ class Coder(metaclass=UsageMeta):
         # The synchronous operation completes quickly without needing a thread pool.
 
         messages = self.format_messages()
+        _coder_debug("send_message: format_messages done")
         if not await self.check_tokens(messages):
             return
 
@@ -2386,6 +2406,7 @@ class Coder(metaclass=UsageMeta):
             while True:
                 try:
                     async for chunk in self.send(messages, tools=self.get_tool_list()):
+                        _coder_debug("send_message: about to call model.send")
                         yield chunk
                     break
                 except litellm_ex.exceptions_tuple() as err:
@@ -2888,11 +2909,13 @@ class Coder(metaclass=UsageMeta):
     async def process_tool_calls(self, tool_call_response):
         """Simplified main entry point."""
         # Check if max tool calls exceeded
+        _coder_debug("process_tool_calls: ENTER")
         if self.num_tool_calls >= self.max_tool_calls:
             self.io.tool_warning(f"Only {self.max_tool_calls} tool calls allowed, stopping.")
             return False
 
         # 1. Extract and prepare tool calls
+        _coder_debug("process_tool_calls: extracted calls")
         prepared_calls = self._extract_and_prepare_tool_calls(tool_call_response)
         if not prepared_calls:
             return False
